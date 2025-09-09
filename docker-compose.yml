@@ -1,0 +1,43 @@
+version: '3.8'
+
+services:
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    command: redis-server --appendonly yes
+    volumes:
+      - redis_data:/data
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=sqlite:///./code_review.db
+      - SECRET_KEY=your-secret-key-change-in-production
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+
+  worker:
+    build: .
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - CELERY_BROKER_URL=redis://redis:6379/0
+      - CELERY_RESULT_BACKEND=redis://redis:6379/0
+      - DATABASE_URL=sqlite:///./code_review.db
+      - SECRET_KEY=your-secret-key-change-in-production
+    depends_on:
+      - redis
+    volumes:
+      - .:/app
+    command: celery -A app.services.celery_app worker --loglevel=info
+
+volumes:
+  redis_data:
