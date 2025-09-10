@@ -16,6 +16,7 @@ from app.models.schemas import (
 )
 from app.services.task_service import TaskService
 from app.services.celery_app import analyze_pr_task
+from app.services.cache_service import CacheService
 from app.core.logging import get_logger
 
 logger = get_logger(__name__)
@@ -45,15 +46,24 @@ async def analyze_pr(
         # Generate unique task ID
         task_id = str(uuid.uuid4())
 
-        # Create task record
-        await task_service.create_task(
+        # Create task record (checks cache first)
+        cached_result = await task_service.create_task(
             task_id=task_id,
             repo_url=str(request.repo_url),
             pr_number=request.pr_number,
             github_token=request.github_token
         )
 
-        # Start Celery task
+        # If we have cached results, return completed task immediately
+        if cached_result:
+            logger.info("Returning cached analysis result", task_id=task_id)
+            return TaskResponse(
+                task_id=task_id,
+                status=TaskStatus.COMPLETED,
+                results=cached_result
+            )
+
+        # No cached result, start Celery task
         analyze_pr_task.delay(
             task_id=task_id,
             repo_url=str(request.repo_url),
@@ -407,5 +417,87 @@ async def cleanup_stuck_tasks(
             detail={
                 "error": "cleanup_failed",
                 "message": "Failed to cleanup stuck tasks"
+            }
+        )
+
+
+@router.get("/cache/stats")
+async def get_cache_stats() -> Dict[str, Any]:
+    """
+    Get cache statistics.
+
+    Returns:
+        Cache performance metrics and statistics
+    """
+    try:
+        cache_service = CacheService()
+        stats = cache_service.get_cache_stats()
+
+        logger.info("Cache stats retrieved", stats=stats)
+
+        return {
+            "status": "success",
+            "cache_stats": stats
+        }
+
+    except Exception as e:
+        logger.error("Failed to get cache stats", error=str(e), exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "cache_stats_failed",
+                "message": "Failed to retrieve cache statistics"
+            }
+        )
+
+
+@router.delete("/cache/pr/{repo_owner}/{repo_name}/{pr_number}")
+async def invalidate_pr_cache(
+    repo_owner: str,
+    repo_name: str,
+    pr_number: int
+) -> Dict[str, Any]:
+    """
+    Invalidate cache for a specific PR.
+
+    Args:
+        repo_owner: Repository owner
+        repo_name: Repository name
+        pr_number: Pull request number
+
+    Returns:
+        Cache invalidation result
+    """
+    try:
+        repo_url = f"https://github.com/{repo_owner}/{repo_name}"
+
+        cache_service = CacheService()
+        invalidated = cache_service.invalidate_pr_cache(repo_url, pr_number)
+
+        logger.info("PR cache invalidated",
+                   repo_url=repo_url,
+                   pr_number=pr_number,
+                   invalidated=invalidated)
+
+        return {
+            "status": "success",
+            "repo_url": repo_url,
+            "pr_number": pr_number,
+            "invalidated": invalidated,
+            "message": f"Cache invalidated for PR #{pr_number} in {repo_owner}/{repo_name}"
+        }
+
+    except Exception as e:
+        logger.error("Failed to invalidate PR cache",
+                    repo_owner=repo_owner,
+                    repo_name=repo_name,
+                    pr_number=pr_number,
+                    error=str(e),
+                    exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "cache_invalidation_failed",
+                "message": "Failed to invalidate PR cache"
             }
         )

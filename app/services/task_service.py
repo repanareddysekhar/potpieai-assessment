@@ -14,6 +14,7 @@ from app.models.schemas import (
     TaskStatusResponse,
     AnalysisResults
 )
+from app.services.cache_service import CacheService
 
 logger = get_logger(__name__)
 
@@ -24,6 +25,7 @@ class TaskService:
     def __init__(self):
         """Initialize the task service with Redis connection."""
         self.redis_client = redis.from_url(settings.redis_url, decode_responses=True)
+        self.cache_service = CacheService()
 
     def _get_task_key(self, task_id: str) -> str:
         """Get Redis key for a task."""
@@ -33,22 +35,90 @@ class TaskService:
         """Get Redis key for task results."""
         return f"results:{task_id}"
 
+    async def check_cached_result(self, repo_url: str, pr_number: int) -> Optional[Dict[str, Any]]:
+        """
+        Check if we have a cached result for this PR.
+
+        Args:
+            repo_url: GitHub repository URL
+            pr_number: Pull request number
+
+        Returns:
+            Cached analysis result if available, None otherwise
+        """
+        try:
+            cached_result = self.cache_service.get_cached_pr_analysis_result(repo_url, pr_number)
+
+            if cached_result:
+                logger.info("Found cached analysis result",
+                           repo_url=repo_url,
+                           pr_number=pr_number)
+                return cached_result
+
+            logger.info("No cached result found",
+                       repo_url=repo_url,
+                       pr_number=pr_number)
+            return None
+
+        except Exception as e:
+            logger.error("Error checking cached result",
+                        repo_url=repo_url,
+                        pr_number=pr_number,
+                        error=str(e))
+            return None
+
     async def create_task(
         self,
         task_id: str,
         repo_url: str,
         pr_number: int,
         github_token: Optional[str] = None
-    ) -> None:
+    ) -> Optional[Dict[str, Any]]:
         """
-        Create a new analysis task.
+        Create a new analysis task, checking cache first.
 
         Args:
             task_id: Unique task identifier
             repo_url: GitHub repository URL
             pr_number: Pull request number
             github_token: Optional GitHub token
+
+        Returns:
+            Cached result if available, None if new task created
         """
+        # Check for cached result first
+        cached_result = await self.check_cached_result(repo_url, pr_number)
+        if cached_result:
+            # Store the cached result as completed task
+            task_data = {
+                "task_id": task_id,
+                "status": TaskStatus.COMPLETED.value,
+                "repo_url": repo_url,
+                "pr_number": pr_number,
+                "github_token": github_token,
+                "created_at": datetime.now().isoformat(),
+                "updated_at": datetime.now().isoformat(),
+                "completed_at": datetime.now().isoformat()
+            }
+
+            # Store task data
+            self.redis_client.setex(
+                self._get_task_key(task_id),
+                86400,  # 24 hours
+                json.dumps(task_data)
+            )
+
+            # Store cached results
+            await self.store_task_results(task_id, cached_result)
+
+            logger.info("Task completed with cached result",
+                       task_id=task_id,
+                       repo_url=repo_url,
+                       pr_number=pr_number)
+
+            return cached_result
+
+        # No cached result, create new task
         task_data = {
             "task_id": task_id,
             "status": TaskStatus.PENDING.value,
@@ -66,7 +136,8 @@ class TaskService:
             json.dumps(task_data)
         )
 
-        logger.info("Task created", task_id=task_id, repo_url=repo_url, pr_number=pr_number)
+        logger.info("New task created", task_id=task_id, repo_url=repo_url, pr_number=pr_number)
+        return None
 
     async def update_task_status(
         self,
@@ -160,7 +231,7 @@ class TaskService:
 
     async def store_task_results(self, task_id: str, results: AnalysisResults) -> None:
         """
-        Store analysis results.
+        Store analysis results and cache them for future use.
 
         Args:
             task_id: Task identifier
@@ -189,6 +260,31 @@ class TaskService:
                 86400,  # 24 hours
                 results_json
             )
+
+            # Also cache the results for future PR analysis requests
+            task_data = await self.get_task_status(task_id)
+            if task_data and hasattr(task_data, 'repo_url') and hasattr(task_data, 'pr_number'):
+                # Get repo_url and pr_number from task data
+                task_key = self._get_task_key(task_id)
+                task_json = self.redis_client.get(task_key)
+                if task_json:
+                    task_info = json.loads(task_json)
+                    repo_url = task_info.get('repo_url')
+                    pr_number = task_info.get('pr_number')
+
+                    if repo_url and pr_number:
+                        # Cache the analysis result for future requests
+                        self.cache_service.cache_pr_analysis_result(
+                            repo_url=repo_url,
+                            pr_number=pr_number,
+                            result=results_dict,
+                            ttl=3600  # 1 hour cache
+                        )
+
+                        logger.info("Results cached for future requests",
+                                   task_id=task_id,
+                                   repo_url=repo_url,
+                                   pr_number=pr_number)
 
             logger.info("Task results stored successfully",
                        task_id=task_id,
