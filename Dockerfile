@@ -14,11 +14,17 @@ RUN apt-get update \
         gcc \
         g++ \
         libpq-dev \
+        curl \
+        netcat-openbsd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Python dependencies
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy Redis wait script
+COPY wait-for-redis.sh /usr/local/bin/wait-for-redis.sh
+RUN chmod +x /usr/local/bin/wait-for-redis.sh
 
 # Copy project
 COPY . .
